@@ -1,0 +1,172 @@
+import os
+import time
+import random
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.nn import BatchNorm1d, Dropout, Linear
+from torch.utils.data import DataLoader, TensorDataset, Subset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import f1_score, precision_score, recall_score, confusion_matrix
+from sklearn.manifold import TSNE
+import matplotlib.pyplot as plt
+from torch_geometric.nn import ARMAConv
+
+# ================== 基础配置 ================== #
+SEED = 44
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+torch.cuda.set_device(DEVICE)
+print('[INFO] Using device:', DEVICE)
+
+# ================== 模型定义 ================== #
+class SCG(nn.Module):
+    """基于自构造图的ARMA-GNN模块"""
+    def __init__(self, in_features, in_channels, bn_features, out_features, topk, dropout_rate=0.3):
+        super().__init__()
+        self.channels = in_channels
+        self.topk = topk
+        self.bnlin = Linear(in_features, bn_features)
+        self.conv1 = ARMAConv(bn_features, out_features, num_stacks=3, num_layers=2, shared_weights=False)
+        self.bn1 = BatchNorm1d(in_channels)
+        self.dropout = Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = x.view(-1, self.channels, x.size(-1))
+        xa = torch.tanh(self.bnlin(x))
+        adj = torch.softmax(torch.matmul(xa, xa.transpose(2, 1)), dim=2)
+
+        # Top-k稀疏化
+        amask = torch.zeros_like(adj)
+        _, idx = adj.topk(self.topk, dim=2)
+        amask.scatter_(2, idx, 1)
+        adj = adj * amask
+
+        # 构建边索引
+        edge_index_batch = torch.cat([torch.nonzero(adj[i], as_tuple=False).T for i in range(xa.size(0))], dim=1)
+
+        x = F.relu(self.bn1(self.conv1(xa, edge_index_batch)))
+        return self.dropout(x)
+
+class EEG_CNN(nn.Module):
+    """主模型：SCG + 全连接分类器"""
+    def __init__(self, in_features=8, num_channels=19, hidden_features=32, topk=14, num_classes=2):
+        super().__init__()
+        self.scg = SCG(in_features, num_channels, hidden_features, hidden_features, topk)
+        self.fc = Linear(hidden_features * num_channels, num_classes)
+
+    def forward(self, x):
+        x = self.scg(x)
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+# ================== 辅助函数 ================== #
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+
+# t-SNE可视化
+def tsne_visualize(data, labels, title, save_path):
+    tsne = TSNE(n_components=2, random_state=SEED)
+    tsne_results = tsne.fit_transform(data)
+    plt.figure(figsize=(8, 6))
+    plt.scatter(tsne_results[:, 0], tsne_results[:, 1], c=labels, cmap='viridis', alpha=0.6, edgecolors='w', s=50)
+    plt.title(title)
+    plt.savefig(save_path)
+    plt.close()
+
+# ================== 数据加载 ================== #
+MASTER_DATASET_INDEX = pd.read_csv(r"D:\Code\X_EEG_Model\Data_Process\Step3_Data_Results\HUSM\MDD_Subject_Rest_Window_Index_Sample_Unit.csv")
+subjects_data = ['1','2','3','4','5','6','7','8','9','10','11','13','14','15','16','17','19','20','21','22','23','24','25','26','27','28','29','30','31','32','33','35','36','37','39','40','41','43','44','45','47','48','49','50','51','52','53','54','55','56','57','58','59','60','61','62','63','64']
+subjects_labels = [0]*28 + [1]*31
+
+X_ALL_Features = np.load(r"D:\Code\X_EEG_Model\Data_Process\Step3_Data_Results\HUSM\X_alL_feature_matrix_Rest_Unit_Filter_PSD_Region_EC_reshape.npy", mmap_mode='r')
+Labels_y = np.load(r"D:\Code\X_EEG_Model\Data_Process\Step3_Data_Results\HUSM\y_text_label_Rest.npy", allow_pickle=True)
+
+# 数据转换
+label_map = {'No_MDD': 0, 'MDD': 1}
+numeric_labels = np.array([label_map[label] for label in Labels_y])
+X_ALL_Features = torch.tensor(X_ALL_Features.astype('float32')).to(DEVICE)
+Labels_y = torch.tensor(numeric_labels.astype('long')).to(DEVICE)
+
+# ================== 训练配置 ================== #
+skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
+BATCH_SIZE, num_epochs, lr = 32, 50, 0.0005
+
+Result_File = r"D:\Code\X_EEG_Model\Results\GNMixer_results.txt"
+os.makedirs(os.path.dirname(Result_File), exist_ok=True)
+
+# ================== 10折交叉验证 ================== #
+with open(Result_File, "w") as file:
+    for fold, (train_idx, test_idx) in enumerate(skf.split(subjects_data, subjects_labels), 1):
+        print(f"\n[Fold {fold}] Training...")
+        train_ID = [subjects_data[i] for i in train_idx]
+        test_ID = [subjects_data[i] for i in test_idx]
+
+        train_indices = MASTER_DATASET_INDEX.index[MASTER_DATASET_INDEX["patient_id"].astype("str").isin(train_ID)].tolist()
+        test_indices = MASTER_DATASET_INDEX.index[MASTER_DATASET_INDEX["patient_id"].astype("str").isin(test_ID)].tolist()
+
+        train_loader = DataLoader(Subset(TensorDataset(X_ALL_Features, Labels_y), train_indices), batch_size=BATCH_SIZE, shuffle=True)
+        test_loader = DataLoader(Subset(TensorDataset(X_ALL_Features, Labels_y), test_indices), batch_size=BATCH_SIZE, shuffle=False)
+
+        model = EEG_CNN().to(DEVICE)
+        criterion = nn.CrossEntropyLoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.9)
+
+        fold_results = {'train_acc': [], 'test_acc': [], 'train_f1': [], 'test_f1': []}
+
+        for epoch in range(num_epochs):
+            model.train()
+            train_loss, correct_train, total_train = 0, 0, 0
+            true_train, pred_train = [], []
+
+            for X_batch, y_batch in train_loader:
+                optimizer.zero_grad()
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item()
+                _, predicted = outputs.max(1)
+                correct_train += predicted.eq(y_batch).sum().item()
+                total_train += y_batch.size(0)
+                true_train.extend(y_batch.cpu().numpy())
+                pred_train.extend(predicted.cpu().numpy())
+
+            train_acc = correct_train / total_train
+            train_f1 = f1_score(true_train, pred_train)
+            fold_results['train_acc'].append(train_acc)
+            fold_results['train_f1'].append(train_f1)
+
+            # 验证
+            model.eval()
+            correct_test, total_test = 0, 0
+            true_test, pred_test = [], []
+            with torch.no_grad():
+                for X_batch, y_batch in test_loader:
+                    outputs = model(X_batch)
+                    _, predicted = outputs.max(1)
+                    correct_test += predicted.eq(y_batch).sum().item()
+                    total_test += y_batch.size(0)
+                    true_test.extend(y_batch.cpu().numpy())
+                    pred_test.extend(predicted.cpu().numpy())
+
+            test_acc = correct_test / total_test
+            test_f1 = f1_score(true_test, pred_test)
+            fold_results['test_acc'].append(test_acc)
+            fold_results['test_f1'].append(test_f1)
+
+            print(f"Epoch [{epoch+1}/{num_epochs}] Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}")
+
+        avg_test_acc = np.mean(fold_results['test_acc'])
+        avg_test_f1 = np.mean(fold_results['test_f1'])
+        file.write(f"Fold {fold}: Test Acc: {avg_test_acc:.4f}, Test F1: {avg_test_f1:.4f}\n")
+        print(f"Fold {fold} Summary: Test Acc: {avg_test_acc:.4f}, Test F1: {avg_test_f1:.4f}")
