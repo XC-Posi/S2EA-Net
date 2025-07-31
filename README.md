@@ -13,5 +13,5 @@ This repository provides the **PyTorch implementation** of the paper:
 
 ### Illustration
 <div align=center>
-<img src="https://github.com/YuhangLiu98/SDCNN/blob/main/img/SDCNN.png" width="800"/> 
+<img src="https://github.com/YuhangLiu98/SDCNN/blob/main/img/SDCNN.png](https://github.com/XC-Posi/S2EA-Net/blob/main/S2EA-Net-Architecture.png" width="800"/> 
 </div>
