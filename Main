@@ -1,0 +1,253 @@
+import os
+import time
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Subset, TensorDataset
+from sklearn.model_selection import StratifiedKFold
+import random
+from torch_geometric.data import DataLoader
+from torch.nn import Linear, BatchNorm1d, Dropout
+import torch.nn.functional as F
+from typing import Optional, Callable
+from torch import Tensor
+from torch.nn import ReLU
+from torch.nn.parameter import Parameter
+from torch_geometric.nn.conv import MessagePassing
+from torch_geometric.typing import Adj, OptTensor
+from torch_sparse import SparseTensor, matmul
+from torch_geometric.nn.inits import glorot, zeros
+from torch_geometric.nn.conv.gcn_conv import gcn_norm
+
+SEED = 44
+np.random.seed(SEED)
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+
+DEVICE = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+torch.cuda.set_device(DEVICE)
+print('[MAIN] GPU device:', DEVICE, torch.cuda.get_device_name(DEVICE))
+
+class ARMAConv(MessagePassing):
+    def __init__(self, in_channels: int, out_channels: int,
+                 num_stacks: int = 1, num_layers: int = 1,
+                 shared_weights: bool = False,
+                 act: Optional[Callable] = ReLU(), dropout: float = 0.,
+                 bias: bool = True, **kwargs):
+        kwargs.setdefault('aggr', 'add')
+        super().__init__(**kwargs)
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.num_stacks = num_stacks
+        self.num_layers = num_layers
+        self.act = act
+        self.shared_weights = shared_weights
+        self.dropout = dropout
+
+        K, T, F_in, F_out = num_stacks, num_layers, in_channels, out_channels
+        T = 1 if self.shared_weights else T
+
+        self.weight = Parameter(torch.Tensor(max(1, T - 1), K, F_out, F_out))
+        if in_channels > 0:
+            self.init_weight = Parameter(torch.Tensor(K, F_in, F_out))
+            self.root_weight = Parameter(torch.Tensor(T, K, F_in, F_out))
+        else:
+            self.init_weight = torch.nn.parameter.UninitializedParameter()
+            self.root_weight = torch.nn.parameter.UninitializedParameter()
+            self._hook = self.register_forward_pre_hook(
+                self.initialize_parameters)
+
+        if bias:
+            self.bias = Parameter(torch.Tensor(T, K, 1, F_out))
+        else:
+            self.register_parameter('bias', None)
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        glorot(self.weight)
+        if not isinstance(self.init_weight, torch.nn.UninitializedParameter):
+            glorot(self.init_weight)
+            glorot(self.root_weight)
+        zeros(self.bias)
+
+    def forward(self, x: Tensor, edge_index: Adj,
+                edge_weight: OptTensor = None) -> Tensor:
+        if isinstance(edge_index, Tensor):
+            edge_index, edge_weight = gcn_norm(
+                edge_index, edge_weight, x.size(self.node_dim),
+                add_self_loops=False, dtype=x.dtype)
+
+        elif isinstance(edge_index, SparseTensor):
+            edge_index = gcn_norm(
+                edge_index, edge_weight, x.size(self.node_dim),
+                add_self_loops=False, dtype=x.dtype)
+
+        x = x.unsqueeze(-3)
+        out = x
+        for t in range(self.num_layers):
+            if t == 0:
+                out = out @ self.init_weight
+            else:
+                out = out @ self.weight[0 if self.shared_weights else t - 1]
+
+            out = self.propagate(edge_index, x=out, edge_weight=edge_weight,
+                                 size=None)
+
+            root = F.dropout(x, p=self.dropout, training=self.training)
+            out += root @ self.root_weight[0 if self.shared_weights else t]
+
+            if self.bias is not None:
+                out += self.bias[0 if self.shared_weights else t]
+
+            if self.act is not None:
+                out = self.act(out)
+
+        return out.mean(dim=-3)
+
+    def message(self, x_j: Tensor, edge_weight: Tensor) -> Tensor:
+        return edge_weight.view(-1, 1) * x_j
+
+    def message_and_aggregate(self, adj_t: SparseTensor, x: Tensor) -> Tensor:
+        return matmul(adj_t, x, reduce=self.aggr)
+
+    @torch.no_grad()
+    def initialize_parameters(self, module, input):
+        if isinstance(self.init_weight, nn.parameter.UninitializedParameter):
+            F_in, F_out = input[0].size(-1), self.out_channels
+            T, K = self.weight.size(0) + 1, self.weight.size(1)
+            self.init_weight.materialize((K, F_in, F_out))
+            self.root_weight.materialize((T, K, F_in, F_out))
+            glorot(self.init_weight)
+            glorot(self.root_weight)
+
+        module._hook.remove()
+        delattr(module, '_hook')
+
+    def __repr__(self) -> str:
+        return (f'{self.__class__.__name__}({self.in_channels}, '
+                f'{self.out_channels}, num_stacks={self.num_stacks}, '
+                f'num_layers={self.num_layers})')
+
+class SCG(nn.Module):
+    def __init__(self, in_features: int, in_channels: int, bn_features: int, out_features: int, topk: int,
+                 dropout_rate=0.3):
+        super().__init__()
+        self.channels = in_channels
+        self.in_features = in_features
+        self.bn_features = bn_features
+        self.out_features = out_features
+        self.topk = topk
+
+        self.bnlin = Linear(in_features, bn_features)
+        self.conv1 = ARMAConv(bn_features, out_features, num_stacks=3, num_layers=2, shared_weights=False)
+        self.bn1 = BatchNorm1d(in_channels)
+        self.dropout = Dropout(dropout_rate)
+
+    def forward(self, x):
+        x = x.reshape(-1, self.channels, self.in_features)
+        xa = torch.tanh(self.bnlin(x))
+
+        adj = torch.matmul(xa, xa.transpose(2, 1))
+        adj = torch.softmax(adj, dim=2)
+
+        amask = torch.zeros_like(adj)
+        _, t = adj.topk(self.topk, dim=2)
+        amask.scatter_(2, t, 1)
+        adj = adj * amask
+
+        edge_indices = [torch.nonzero(adj[i], as_tuple=False).T for i in range(xa.size(0))]
+        edge_index_batch = torch.cat(edge_indices, dim=1)
+
+        x = F.relu(self.bn1(self.conv1(xa, edge_index_batch)))
+        x = self.dropout(x)
+        return x
+
+class EEG_CNN(nn.Module):
+    def __init__(self, in_features=8, num_channels=19, hidden_features=32, topk=14, num_classes=2):
+        super(EEG_CNN, self).__init__()
+        self.scg = SCG(in_features, num_channels, hidden_features, hidden_features, topk)
+        self.fc = Linear(hidden_features * num_channels, num_classes)
+
+    def forward(self, x):
+        x = self.scg(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+
+print("[MAIN] Loading preprocessed data...")
+MASTER_DATASET_INDEX = pd.read_csv("")
+
+subjects_data = []
+subjects_labels = []
+
+X_ALL_Features = np.load(".npy", mmap_mode='r')
+Labels_y = np.load(".npy", allow_pickle=True)
+
+X_ALL_Features = torch.from_numpy(X_ALL_Features.astype('float32')).to(DEVICE)
+label_map = {'No_MDD': 0, 'MDD': 1}
+numeric_labels = np.array([label_map[label] for label in Labels_y])
+Labels_y = torch.from_numpy(numeric_labels.astype('long')).to(DEVICE)
+
+skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=SEED)
+
+for fold, (train_index, test_index) in enumerate(skf.split(subjects_data, subjects_labels), 1):
+    print(f'{"**" * 10} Fold {fold} {"**" * 10}')
+
+    train_ID, test_ID = [subjects_data[i] for i in train_index], [subjects_data[i] for i in test_index]
+    print(f'The Train subsets total {len(train_ID)}，including: {train_ID}')
+    print(f'The Test subsets total {len(test_ID)}，including: {test_ID}')
+
+    data_train_indices = MASTER_DATASET_INDEX.index[
+        MASTER_DATASET_INDEX["patient_id"].astype("str").isin(train_ID)].tolist()
+    data_test_indices = MASTER_DATASET_INDEX.index[
+        MASTER_DATASET_INDEX["patient_id"].astype("str").isin(test_ID)].tolist()
+
+    dataset = TensorDataset(X_ALL_Features, Labels_y)
+    train_dataset = Subset(dataset, data_train_indices)
+    test_dataset = Subset(dataset, data_test_indices)
+
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=True)
+
+    model = EEG_CNN().to(DEVICE)
+    criterion = nn.CrossEntropyLoss().to(DEVICE)
+    optimizer = optim.Adam(model.parameters(), lr=0.0005, weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.9, verbose=True)
+
+    num_epochs = 500
+    for epoch in range(num_epochs):
+        model.train()
+        epoch_loss = 0.0
+
+        for batch_x, batch_y in train_loader:
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(train_loader)
+        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_loss:.4f}")
+
+    print(f"[Fold {fold}] Evaluating on test set...")
+    model.eval()
+    predictions = []
+    true_labels = []
+    with torch.no_grad():
+        for batch_x, batch_y in test_loader:
+            outputs = model(batch_x)
+            _, predicted = torch.max(outputs, 1)
+            predictions.extend(predicted.cpu().numpy())
+            true_labels.extend(batch_y.cpu().numpy())
+
+    predictions = np.array(predictions)
+    true_labels = np.array(true_labels)
+    accuracy = (predictions == true_labels).mean()
+    print(f"[Fold {fold}] Test Accuracy: {accuracy:.4f}")
