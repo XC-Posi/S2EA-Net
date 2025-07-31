@@ -21,7 +21,7 @@ from torch_sparse import SparseTensor, matmul
 from torch_geometric.nn.inits import glorot, zeros
 from torch_geometric.nn.conv.gcn_conv import gcn_norm
 
-SEED = 44
+SEED = 44 # Generate five seeds randomly
 np.random.seed(SEED)
 random.seed(SEED)
 torch.manual_seed(SEED)
