@@ -15,3 +15,20 @@ This repository provides the **PyTorch implementation** of the paper:
 <div align=center>
 <img src="https://github.com/XC-Posi/S2EA-Net/blob/main/S2EA-Net-Architecture.png" width="800"/>
 </div>
+
+### Visualization
+<div align=center>
+<img src="https://github.com/XC-Posi/S2EA-Net/blob/main/Comparison-of-topography.png" width="800"/>
+</div>
+
+For visualization tools, please refer to: Gramfort A., Luessi M., Larson E., Engemann D.A., Strohmeier D., Brodbeck C., Parkkonen L., Hämäläinen M.S., MNE software for processing MEG and EEG data[J]. Neuroimage, 2014, 86:446-460.
+or: https://mne.tools/stable/index.html
+
+### DATASET
+
+1.HUSM Dataset   
+Please refer to: Mumtaz W, Xia L, Mohd Yasin M A, et al. A wavelet-based technique to predict treatment outcome for major depressive disorder[J]. PloS one, 2017, 12(2): e0171409.
+
+2.MODMA Dataset   
+Please refer to: Cai H, Yuan Z, Gao Y, et al. A multi-modal open dataset for mental-disorder analysis[J]. Scientific Data, 2022, 9(1): 178.
+
