@@ -33,4 +33,4 @@ For the data preprocessing tools, please refer to: Delorme A., Makeig S., EEGLAB
 </div>
 
 For visualization tools, please refer to: Gramfort A., Luessi M., Larson E., Engemann D.A., Strohmeier D., Brodbeck C., Parkkonen L., Hämäläinen M.S., MNE software for processing MEG and EEG data[J]. Neuroimage, 2014, 86:446-460.
-or: https://mne.tools/stable/index.html
+or: https://mne.tools/stable/index.html.
